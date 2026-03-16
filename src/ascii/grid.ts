@@ -8,7 +8,7 @@
 // ============================================================================
 
 import type {
-  GridCoord, DrawingCoord, Direction, AsciiGraph, AsciiNode, AsciiSubgraph,
+  GridCoord, DrawingCoord, Direction, AsciiEdge, AsciiGraph, AsciiNode, AsciiSubgraph,
 } from './types.ts'
 import { gridKey } from './types.ts'
 import { mkCanvas, setCanvasSizeToGrid, setRoleCanvasSizeToGrid } from './canvas.ts'
@@ -536,6 +536,15 @@ export function createMapping(graph: AsciiGraph): void {
   // Route bundled edges through junction points
   processBundles(graph)
 
+  // Seed the occupancy map with any paths produced during bundle processing so the
+  // remaining edges can avoid reusing those corridors unless the overlap is intentional.
+  const occupiedEdgeCells = new Map<string, AsciiEdge[]>()
+  for (const edge of graph.edges) {
+    if (edge.path.length > 0) {
+      markPathCellsOccupied(occupiedEdgeCells, edge.path, edge)
+    }
+  }
+
   // Route non-bundled edges via A* and determine label positions
   for (const edge of graph.edges) {
     // Skip edges that were already routed as part of a bundle
@@ -545,8 +554,9 @@ export function createMapping(graph: AsciiGraph): void {
       continue
     }
 
-    determinePath(graph, edge)
+    determinePath(graph, edge, occupiedEdgeCells)
     increaseGridSizeForPath(graph, edge.path)
+    markPathCellsOccupied(occupiedEdgeCells, edge.path, edge)
     determineLabelLine(graph, edge)
   }
 
@@ -575,4 +585,55 @@ function getEdgesFromNode(graph: AsciiGraph, node: AsciiNode): AsciiGraph['edges
 /** Get all direct children of a node (targets of outgoing edges). */
 function getChildren(graph: AsciiGraph, node: AsciiNode): AsciiNode[] {
   return getEdgesFromNode(graph, node).map(e => e.to)
+}
+
+/**
+ * Expand a merged path back into unit grid cells and record every traversed cell except
+ * the final attachment point at the destination node. The destination cell stays free so
+ * later edges can still enter/leave the same node side when that overlap is legitimate.
+ */
+function markPathCellsOccupied(
+  occupied: Map<string, AsciiEdge[]>,
+  path: GridCoord[],
+  edge: AsciiEdge,
+): void {
+  if (path.length < 2) return
+
+  const last = path[path.length - 1]!
+
+  for (let i = 1; i < path.length; i++) {
+    const from = path[i - 1]!
+    const to = path[i]!
+    const dx = Math.sign(to.x - from.x)
+    const dy = Math.sign(to.y - from.y)
+    let x = from.x + dx
+    let y = from.y + dy
+
+    while (true) {
+      if (x !== last.x || y !== last.y) {
+        appendOccupiedEdge(occupied, gridKey({ x, y }), edge)
+      }
+
+      if (x === to.x && y === to.y) {
+        break
+      }
+
+      x += dx
+      y += dy
+    }
+  }
+}
+
+/** Append one routed edge to the occupancy list for a specific grid cell. */
+function appendOccupiedEdge(
+  occupied: Map<string, AsciiEdge[]>,
+  key: string,
+  edge: AsciiEdge,
+): void {
+  const edges = occupied.get(key)
+  if (edges) {
+    edges.push(edge)
+  } else {
+    occupied.set(key, [edge])
+  }
 }
