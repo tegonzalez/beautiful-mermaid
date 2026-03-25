@@ -15,6 +15,7 @@ import type { Canvas, AsciiConfig, RoleCanvas, CharRole, AsciiTheme, ColorMode }
 import { mkCanvas, mkRoleCanvas, canvasToString, increaseSize, increaseRoleCanvasSize, setRole } from './canvas.ts'
 import { drawMultiBox } from './draw.ts'
 import { splitLines } from './multiline-utils.ts'
+import { wrapText } from './layout-budget.ts'
 
 /** Classify a character from a box drawing as 'border' or 'text'. */
 function classifyBoxChar(ch: string): CharRole {
@@ -39,6 +40,26 @@ function buildEntitySections(entity: ErEntity): string[][] {
   const attrs = entity.attributes.map(formatAttribute)
   if (attrs.length === 0) return [header]
   return [header, attrs]
+}
+
+function measureSections(sections: string[][]): { width: number; height: number } {
+  let maxTextW = 0
+  for (const section of sections) {
+    for (const line of section) maxTextW = Math.max(maxTextW, line.length)
+  }
+
+  let totalLines = 0
+  for (const section of sections) totalLines += Math.max(section.length, 1)
+
+  return {
+    width: maxTextW + 4,
+    height: totalLines + (sections.length - 1) + 2,
+  }
+}
+
+function wrapSectionsToBoxWidth(sections: string[][], maxBoxWidth: number): string[][] {
+  const contentBudget = Math.max(1, maxBoxWidth - 4)
+  return sections.map(section => section.flatMap(line => splitLines(wrapText(line, contentBudget))))
 }
 
 // ============================================================================
@@ -89,6 +110,42 @@ interface PlacedEntity {
   y: number
   width: number
   height: number
+}
+
+function estimateMaxRowWidth(widths: number[], maxPerRow: number, hGap: number): number {
+  let maxWidth = 0
+  for (let start = 0; start < widths.length; start += maxPerRow) {
+    const row = widths.slice(start, start + maxPerRow)
+    const rowWidth = row.reduce((sum, width) => sum + width, 0) + Math.max(0, row.length - 1) * hGap
+    maxWidth = Math.max(maxWidth, rowWidth)
+  }
+  return maxWidth
+}
+
+function chooseMaxPerRow(widths: number[], defaultMaxPerRow: number, maxWidth?: number): number {
+  if (!maxWidth || maxWidth <= 0 || widths.length <= 1) return defaultMaxPerRow
+  for (let candidate = defaultMaxPerRow; candidate >= 1; candidate--) {
+    if (estimateMaxRowWidth(widths, candidate, 1) + 4 <= maxWidth) {
+      return candidate
+    }
+  }
+  return 1
+}
+
+function chooseHorizontalGap(widths: number[], maxPerRow: number, maxWidth?: number): number {
+  const defaultGap = 6
+  if (!maxWidth || maxWidth <= 0 || widths.length <= 1) return defaultGap
+
+  let fittedGap = defaultGap
+  for (let start = 0; start < widths.length; start += maxPerRow) {
+    const row = widths.slice(start, start + maxPerRow)
+    if (row.length <= 1) continue
+    const rowWidth = row.reduce((sum, width) => sum + width, 0)
+    const allowed = Math.floor((maxWidth - 4 - rowWidth) / (row.length - 1))
+    fittedGap = Math.min(fittedGap, allowed)
+  }
+
+  return Math.max(1, Math.min(defaultGap, fittedGap))
 }
 
 // ============================================================================
@@ -163,12 +220,11 @@ export function renderErAscii(text: string, config: AsciiConfig, colorMode?: Col
   if (diagram.entities.length === 0) return ''
 
   const useAscii = config.useAscii
-  const hGap = 6  // horizontal gap between entity boxes
   const vGap = 4  // vertical gap between rows (for relationship lines)
   const componentGap = 6  // vertical gap between disconnected components
 
   // --- Build entity box dimensions ---
-  const entitySections = new Map<string, string[][]>()
+  const naturalSections = new Map<string, string[][]>()
   const entityBoxW = new Map<string, number>()
   const entityBoxH = new Map<string, number>()
   const entityById = new Map<string, ErEntity>()
@@ -176,20 +232,10 @@ export function renderErAscii(text: string, config: AsciiConfig, colorMode?: Col
   for (const ent of diagram.entities) {
     entityById.set(ent.id, ent)
     const sections = buildEntitySections(ent)
-    entitySections.set(ent.id, sections)
-
-    let maxTextW = 0
-    for (const section of sections) {
-      for (const line of section) maxTextW = Math.max(maxTextW, line.length)
-    }
-    const boxW = maxTextW + 4 // 2 border + 2 padding
-
-    let totalLines = 0
-    for (const section of sections) totalLines += Math.max(section.length, 1)
-    const boxH = totalLines + (sections.length - 1) + 2
-
-    entityBoxW.set(ent.id, boxW)
-    entityBoxH.set(ent.id, boxH)
+    naturalSections.set(ent.id, sections)
+    const dims = measureSections(sections)
+    entityBoxW.set(ent.id, dims.width)
+    entityBoxH.set(ent.id, dims.height)
   }
 
   // --- Find connected components ---
@@ -202,31 +248,42 @@ export function renderErAscii(text: string, config: AsciiConfig, colorMode?: Col
   for (const component of components) {
     // Get entities in this component (preserve original order for consistency)
     const componentEntities = diagram.entities.filter(e => component.has(e.id))
+    const componentWidths = componentEntities.map(ent => entityBoxW.get(ent.id) ?? 0)
 
     // Layout entities within this component horizontally
     // Use sqrt-based row limit for larger components
-    const maxPerRow = Math.max(2, Math.ceil(Math.sqrt(componentEntities.length)))
+    const defaultMaxPerRow = Math.max(2, Math.ceil(Math.sqrt(componentEntities.length)))
+    const maxPerRow = chooseMaxPerRow(componentWidths, defaultMaxPerRow, config.maxWidth)
+    const hGap = chooseHorizontalGap(componentWidths, maxPerRow, config.maxWidth)
 
     let currentX = 0
     let maxRowH = 0
     let colCount = 0
-    const componentStartY = currentY
+    const rowBudget = config.maxWidth && config.maxWidth > 0 ? Math.max(12, config.maxWidth - 4) : Number.POSITIVE_INFINITY
 
     for (const ent of componentEntities) {
-      const w = entityBoxW.get(ent.id)!
-      const h = entityBoxH.get(ent.id)!
+      const baseSections = naturalSections.get(ent.id)!
+      let sections = baseSections
+      let { width: w, height: h } = measureSections(sections)
 
-      if (colCount >= maxPerRow) {
+      if (colCount >= maxPerRow || (currentX > 0 && currentX + w > rowBudget)) {
         // Wrap to next row within this component
         currentY += maxRowH + vGap
         currentX = 0
         maxRowH = 0
         colCount = 0
+        sections = baseSections
+        ;({ width: w, height: h } = measureSections(sections))
+      }
+
+      if (config.maxWidth && config.maxWidth > 0 && currentX === 0 && w > rowBudget) {
+        sections = wrapSectionsToBoxWidth(baseSections, rowBudget)
+        ;({ width: w, height: h } = measureSections(sections))
       }
 
       placed.set(ent.id, {
         entity: ent,
-        sections: entitySections.get(ent.id)!,
+        sections,
         x: currentX,
         y: currentY,
         width: w,

@@ -377,6 +377,84 @@ export function offsetDrawingForSubgraphs(graph: AsciiGraph): void {
 }
 
 // ============================================================================
+// Width-constrained layout
+// ============================================================================
+
+function estimateNodeWidth(graph: AsciiGraph, node: AsciiNode): number {
+  const dims = getShapeDimensions(node.shape, node.displayLabel, {
+    useAscii: graph.config.useAscii,
+    padding: graph.config.boxBorderPadding,
+  })
+  return (dims.gridColumns[0] ?? 0) + (dims.gridColumns[1] ?? 0)
+}
+
+/**
+ * Re-pack wide LR layouts into vertical bands before column widths and edge
+ * routing are computed. This makes maxWidth influence placement rather than
+ * shrinking rendered output after the fact.
+ */
+function rebalanceLevelsForMaxWidth(graph: AsciiGraph): void {
+  const maxW = graph.config.maxWidth
+  if (!maxW || maxW <= 0) return
+  if (graph.config.graphDirection !== 'LR') return
+
+  const levels = new Map<number, AsciiNode[]>()
+  let maxPerpendicular = 0
+  for (const node of graph.nodes) {
+    if (!node.gridCoord) continue
+    const level = node.gridCoord.x
+    const nodes = levels.get(level)
+    if (nodes) nodes.push(node)
+    else levels.set(level, [node])
+    maxPerpendicular = Math.max(maxPerpendicular, node.gridCoord.y)
+  }
+
+  const sortedLevels = [...levels.keys()].sort((a, b) => a - b)
+  if (sortedLevels.length <= 1) return
+
+  const estimatedGap = Math.max(1, Math.min(graph.config.paddingX, 2))
+  const bandStep = maxPerpendicular + 8
+  let bandIndex = 0
+  let bandWidth = 0
+  let levelIndexInBand = 0
+
+  for (const level of sortedLevels) {
+    const nodes = levels.get(level) ?? []
+    let levelWidth = 0
+    for (const node of nodes) {
+      levelWidth = Math.max(levelWidth, estimateNodeWidth(graph, node))
+    }
+
+    const nextWidth = bandWidth === 0 ? levelWidth : bandWidth + estimatedGap + levelWidth
+    if (bandWidth > 0 && nextWidth > maxW) {
+      bandIndex++
+      bandWidth = 0
+      levelIndexInBand = 0
+    }
+
+    const newLevel = levelIndexInBand * 4
+    for (const node of nodes) {
+      node.gridCoord!.x = newLevel
+      node.gridCoord!.y += bandIndex * bandStep
+    }
+
+    bandWidth = bandWidth === 0 ? levelWidth : bandWidth + estimatedGap + levelWidth
+    levelIndexInBand++
+  }
+
+  graph.grid.clear()
+  for (const node of graph.nodes) {
+    if (!node.gridCoord) continue
+    for (let dx = 0; dx < 3; dx++) {
+      for (let dy = 0; dy < 3; dy++) {
+        const reserved: GridCoord = { x: node.gridCoord.x + dx, y: node.gridCoord.y + dy }
+        graph.grid.set(gridKey(reserved), node)
+      }
+    }
+  }
+}
+
+// ============================================================================
 // Main layout orchestrator
 // ============================================================================
 
@@ -522,6 +600,10 @@ export function createMapping(graph: AsciiGraph): void {
     }
     // Safety: break if no progress made (handles disconnected nodes)
     if (placedCount === prevCount) break
+  }
+
+  if (graph.config.maxWidth && graph.config.maxWidth > 0) {
+    rebalanceLevelsForMaxWidth(graph)
   }
 
   // Compute column widths and row heights
