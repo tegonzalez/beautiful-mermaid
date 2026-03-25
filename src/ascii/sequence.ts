@@ -22,12 +22,21 @@ function classifyBoxChar(ch: string): CharRole {
   return 'text'
 }
 
+function visibleWidth(output: string): number {
+  return Math.max(...output.split('\n').map(line => line.replace(/\s+$/u, '').length), 0)
+}
+
 /**
  * Render a Mermaid sequence diagram to ASCII/Unicode text.
  *
  * Pipeline: parse → layout (columns + rows) → draw onto canvas → string.
  */
 export function renderSequenceAscii(text: string, config: AsciiConfig, colorMode?: ColorMode, theme?: AsciiTheme): string {
+  if (config.maxWidth && config.maxWidth > 0) {
+    const unconstrained = renderSequenceAscii(text, { ...config, maxWidth: undefined }, colorMode, theme)
+    if (visibleWidth(unconstrained) <= config.maxWidth) return unconstrained
+  }
+
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('%%'))
   const diagram = parseSequenceDiagram(lines)
 

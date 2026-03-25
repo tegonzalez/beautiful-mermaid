@@ -55,6 +55,10 @@ const ASC = {
   cornerBR: '+',
 } as const
 
+function visibleWidth(output: string): number {
+  return Math.max(...output.split('\n').map(line => line.replace(/\s+$/u, '').length), 0)
+}
+
 function constrainPlotWidth(
   defaultWidth: number,
   minWidth: number,
@@ -104,6 +108,11 @@ export function renderXYChartAscii(
   colorMode: ColorMode,
   theme: AsciiTheme,
 ): string {
+  if (config.maxWidth && config.maxWidth > 0) {
+    const unconstrained = renderXYChartAscii(text, { ...config, maxWidth: undefined }, colorMode, theme)
+    if (visibleWidth(unconstrained) <= config.maxWidth) return unconstrained
+  }
+
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('%%'))
   const chart = parseXYChart(lines)
   const ch = config.useAscii ? ASC : UNI

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'bun:test'
 import { renderMermaidASCII } from '../ascii/index.ts'
 
@@ -26,6 +27,10 @@ function maxLineWidth(output: string): number {
   return Math.max(...output.split('\n').map(line => line.length), 0)
 }
 
+function maxVisibleLineWidth(output: string): number {
+  return Math.max(...output.split('\n').map(line => line.replace(/\s+$/u, '').length), 0)
+}
+
 function squashedContent(output: string): string {
   return output.replace(/[^A-Za-z0-9_]+/g, '')
 }
@@ -52,6 +57,10 @@ function expectWidth(output: string, maxWidth: number): void {
   for (const line of output.split('\n')) {
     expect(line.length).toBeLessThanOrEqual(maxWidth)
   }
+}
+
+function expectMinWidth(output: string, minWidth: number): void {
+  expect(maxLineWidth(output)).toBeGreaterThanOrEqual(minWidth)
 }
 
 function expectUniformLineWidth(output: string): void {
@@ -104,6 +113,63 @@ const diagrams = [
   },
 ] as const
 
+const flowchartWidthFloorCases = [
+  {
+    name: 'graph TD',
+    diagram: `graph TD
+      Root[Alpha Service Platform] --> Left[Beta Service Cluster]
+      Root --> Right[Gamma Service Cluster]
+      Left --> LeftLeaf[Delta Service Output]
+      Right --> RightLeaf[Epsilon Service Output]`,
+    labels: ['Alpha Service Platform', 'Beta Service Cluster', 'Gamma Service Cluster', 'Delta Service Output', 'Epsilon Service Output'],
+    maxWidth: 50,
+    minWidth: 46,
+  },
+  {
+    name: 'flowchart TD',
+    diagram: `flowchart TD
+      Root[Alpha Service Platform] --> Left[Beta Service Cluster]
+      Root --> Right[Gamma Service Cluster]
+      Left --> LeftLeaf[Delta Service Output]
+      Right --> RightLeaf[Epsilon Service Output]`,
+    labels: ['Alpha Service Platform', 'Beta Service Cluster', 'Gamma Service Cluster', 'Delta Service Output', 'Epsilon Service Output'],
+    maxWidth: 50,
+    minWidth: 46,
+  },
+  {
+    name: 'graph LR',
+    diagram: `graph LR
+      A[Alpha Service Platform] --> B[Beta Service Cluster] --> C[Gamma Service Cluster] --> D[Delta Service Output]`,
+    labels: ['Alpha Service Platform', 'Beta Service Cluster', 'Gamma Service Cluster', 'Delta Service Output'],
+    maxWidth: 60,
+    minWidth: 45,
+  },
+  {
+    name: 'flowchart LR',
+    diagram: `flowchart LR
+      A[Alpha Service Platform] --> B[Beta Service Cluster] --> C[Gamma Service Cluster] --> D[Delta Service Output]`,
+    labels: ['Alpha Service Platform', 'Beta Service Cluster', 'Gamma Service Cluster', 'Delta Service Output'],
+    maxWidth: 60,
+    minWidth: 45,
+  },
+] as const
+
+const rootSampleScripts = [
+  'bmd-flowchart',
+  'bmd-state',
+  'bmd-sequence',
+  'bmd-class',
+  'bmd-er',
+  'bmd-xychart',
+] as const
+
+function readDiagramFromScript(scriptName: typeof rootSampleScripts[number]): string {
+  const contents = readFileSync(new URL(`../../${scriptName}`, import.meta.url), 'utf8')
+  const match = contents.match(/<<'EOF'[^\n]*\n([\s\S]*?)\nEOF/u)
+  if (!match) throw new Error(`Failed to extract heredoc diagram from ${scriptName}`)
+  return match[1]!
+}
+
 describe('ASCII width bounding', () => {
   it('keeps the reported LR flowchart sample within visible width in API output', () => {
     const diagram = `graph LR
@@ -149,6 +215,128 @@ describe('ASCII width bounding', () => {
     expectUniformLineWidth(atFixedPoint)
     expect(atFixedPoint).toBe(at80)
   })
+
+  it('does not clip ER relationship labels when the natural gap is too small', () => {
+    const diagram = `erDiagram
+      ACCOUNT ||--o{ PROJECT : owns
+      PROJECT ||--|{ DEPLOYMENT : produces
+
+      ACCOUNT {
+        string billing_email
+      }
+
+      PROJECT {
+        string runtime
+      }
+
+      DEPLOYMENT {
+        string version
+      }`
+
+    const output = renderMermaidASCII(diagram, {
+      useAscii: false,
+      colorMode: 'none',
+    })
+
+    expectContent(output, ['ACCOUNT', 'PROJECT', 'DEPLOYMENT', 'owns', 'produces'])
+    expect(output).toContain('produces')
+    expect(output.split('\n').some(line => line.trim() === 'produces')).toBe(false)
+  })
+
+  it('keeps deep TD flowchart nodes on later rows when maxWidth is applied', () => {
+    const diagram = `flowchart TD
+      Client[Client Request] --> Gateway{Gateway Policy}
+      Gateway -->|allow| Auth[Auth Service]
+      Gateway -->|rate limit| Backoff[Retry Later]
+      Auth --> Session[(Session Store)]
+      Auth --> Profile[Profile Service]
+      Profile --> Cache[(User Cache)]
+      Profile --> Worker[[Async Worker]]
+      Worker --> Queue[(Event Queue)]
+      Queue --> Audit[Audit Trail]
+      Session --> Renderer[Response Builder]
+      Cache --> Renderer
+      Audit --> Renderer
+      Renderer --> Output([Delivered Response])`
+
+    const output = renderMermaidASCII(diagram, {
+      useAscii: true,
+      colorMode: 'none',
+      maxWidth: 60,
+    })
+
+    expectContent(output, [
+      'Client Request',
+      'Gateway Policy',
+      'Auth Service',
+      'Retry Later',
+      'Session Store',
+      'Profile Service',
+      'User Cache',
+      'Async Worker',
+      'Event Queue',
+      'Audit Trail',
+      'Response Builder',
+      'Delivered Response',
+    ])
+    expectWidth(output, 60)
+
+    const lines = output.split('\n')
+    const auditLine = lines.findIndex(line => line.includes('Audit Trail'))
+    const rendererLine = lines.findIndex(line => line.includes('Response Builder'))
+    expect(auditLine).toBeGreaterThanOrEqual(0)
+    expect(rendererLine).toBeGreaterThan(auditLine)
+  })
+
+  it('does not shrink the root flowchart sample when maxWidth exceeds its natural visible width', () => {
+    const diagram = readDiagramFromScript('bmd-flowchart')
+    const baseline = renderMermaidASCII(diagram, {
+      useAscii: true,
+      colorMode: 'none',
+    })
+    const naturalWidth = maxVisibleLineWidth(baseline)
+
+    const widenedBound = renderMermaidASCII(diagram, {
+      useAscii: true,
+      colorMode: 'none',
+      maxWidth: naturalWidth + 28,
+    })
+
+    expect(maxVisibleLineWidth(widenedBound)).toBe(naturalWidth)
+  })
+
+  for (const scriptName of rootSampleScripts) {
+    it(`keeps ${scriptName} at the same visible width when maxWidth equals its natural render width`, () => {
+      const diagram = readDiagramFromScript(scriptName)
+      const baseline = renderMermaidASCII(diagram, {
+        useAscii: true,
+        colorMode: 'none',
+      })
+      const naturalWidth = maxVisibleLineWidth(baseline)
+
+      const rerendered = renderMermaidASCII(diagram, {
+        useAscii: true,
+        colorMode: 'none',
+        maxWidth: naturalWidth,
+      })
+
+      expect(maxVisibleLineWidth(rerendered)).toBe(naturalWidth)
+    })
+  }
+
+  for (const diagramCase of flowchartWidthFloorCases) {
+    it(`keeps ${diagramCase.name} close to the requested width instead of collapsing to a skinny render`, () => {
+      const output = renderMermaidASCII(diagramCase.diagram, {
+        useAscii: true,
+        colorMode: 'none',
+        maxWidth: diagramCase.maxWidth,
+      })
+
+      expectContent(output, diagramCase.labels)
+      expectWidth(output, diagramCase.maxWidth)
+      expectMinWidth(output, diagramCase.minWidth)
+    })
+  }
 
   for (const diagramCase of diagrams) {
     describe(diagramCase.name, () => {

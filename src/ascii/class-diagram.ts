@@ -24,6 +24,10 @@ function classifyBoxChar(ch: string): CharRole {
   return 'text'
 }
 
+function visibleWidth(output: string): number {
+  return Math.max(...output.split('\n').map(line => line.replace(/\s+$/u, '').length), 0)
+}
+
 // ============================================================================
 // Class member formatting
 // ============================================================================
@@ -170,6 +174,11 @@ interface PlacedClass {
  * Pipeline: parse → build boxes → level-based layout → draw boxes → draw relationships → string.
  */
 export function renderClassAscii(text: string, config: AsciiConfig, colorMode?: ColorMode, theme?: AsciiTheme): string {
+  if (config.maxWidth && config.maxWidth > 0) {
+    const unconstrained = renderClassAscii(text, { ...config, maxWidth: undefined }, colorMode, theme)
+    if (visibleWidth(unconstrained) <= config.maxWidth) return unconstrained
+  }
+
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('%%'))
   const diagram = parseClassDiagram(lines)
 

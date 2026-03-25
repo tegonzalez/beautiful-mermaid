@@ -14,13 +14,17 @@ import type { ErDiagram, ErEntity, ErAttribute, Cardinality } from '../er/types.
 import type { Canvas, AsciiConfig, RoleCanvas, CharRole, AsciiTheme, ColorMode } from './types.ts'
 import { mkCanvas, mkRoleCanvas, canvasToString, increaseSize, increaseRoleCanvasSize, setRole } from './canvas.ts'
 import { drawMultiBox } from './draw.ts'
-import { splitLines } from './multiline-utils.ts'
+import { splitLines, maxLineWidth } from './multiline-utils.ts'
 import { wrapText } from './layout-budget.ts'
 
 /** Classify a character from a box drawing as 'border' or 'text'. */
 function classifyBoxChar(ch: string): CharRole {
   if (/^[┌┐└┘├┤┬┴┼│─╭╮╰╯+\-|]$/.test(ch)) return 'border'
   return 'text'
+}
+
+function visibleWidth(output: string): number {
+  return Math.max(...output.split('\n').map(line => line.replace(/\s+$/u, '').length), 0)
 }
 
 // ============================================================================
@@ -110,6 +114,40 @@ interface PlacedEntity {
   y: number
   width: number
   height: number
+}
+
+function widenHorizontalGapsForLabels(placed: Map<string, PlacedEntity>, diagram: ErDiagram): void {
+  let changed = true
+
+  while (changed) {
+    changed = false
+
+    for (const rel of diagram.relationships) {
+      if (!rel.label) continue
+
+      const e1 = placed.get(rel.entity1)
+      const e2 = placed.get(rel.entity2)
+      if (!e1 || !e2) continue
+
+      const e1CY = e1.y + Math.floor(e1.height / 2)
+      const e2CY = e2.y + Math.floor(e2.height / 2)
+      const sameRow = Math.abs(e1CY - e2CY) < Math.max(e1.height, e2.height)
+      if (!sameRow) continue
+
+      const [left, right] = e1.x < e2.x ? [e1, e2] : [e2, e1]
+      const gapWidth = right.x - (left.x + left.width)
+      const requiredGap = maxLineWidth(rel.label)
+      if (gapWidth >= requiredGap) continue
+
+      const delta = requiredGap - gapWidth
+      for (const entity of placed.values()) {
+        if (entity.y === right.y && entity.x >= right.x) {
+          entity.x += delta
+        }
+      }
+      changed = true
+    }
+  }
 }
 
 function estimateMaxRowWidth(widths: number[], maxPerRow: number, hGap: number): number {
@@ -214,6 +252,11 @@ function findConnectedComponents(diagram: ErDiagram): Set<string>[] {
  * Pipeline: parse → build boxes → component-aware layout → draw boxes → draw relationships → string.
  */
 export function renderErAscii(text: string, config: AsciiConfig, colorMode?: ColorMode, theme?: AsciiTheme): string {
+  if (config.maxWidth && config.maxWidth > 0) {
+    const unconstrained = renderErAscii(text, { ...config, maxWidth: undefined }, colorMode, theme)
+    if (visibleWidth(unconstrained) <= config.maxWidth) return unconstrained
+  }
+
   const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.startsWith('%%'))
   const diagram = parseErDiagram(lines)
 
@@ -298,6 +341,8 @@ export function renderErAscii(text: string, config: AsciiConfig, colorMode?: Col
     // Move to next component row (add gap between components)
     currentY += maxRowH + componentGap
   }
+
+  widenHorizontalGapsForLabels(placed, diagram)
 
   // --- Create canvas ---
   let totalW = 0
@@ -392,18 +437,15 @@ export function renderErAscii(text: string, config: AsciiConfig, colorMode?: Col
       }
 
       // Relationship label centered in the gap between the two entities, below the line.
-      // Clamp label to the gap region [startX, endX] to avoid overwriting box borders.
-      // Supports multi-line labels.
+      // Layout widens row gaps ahead of time so the label stays adjacent to the edge.
       if (rel.label) {
         const lines = splitLines(rel.label)
         const gapMid = Math.floor((startX + endX) / 2)
 
-        // Place lines below the relationship line (lineY + 1, lineY + 2, ...)
         for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
           const line = lines[lineIdx]!
           const labelStart = Math.max(startX, gapMid - Math.floor(line.length / 2))
           const labelY = lineY + 1 + lineIdx
-          // Ensure canvas is tall enough
           increaseSize(canvas, Math.max(labelStart + line.length, 1), Math.max(labelY + 1, 1))
           increaseRoleCanvasSize(rc, Math.max(labelStart + line.length, 1), Math.max(labelY + 1, 1))
           for (let i = 0; i < line.length; i++) {

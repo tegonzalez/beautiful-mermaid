@@ -27,7 +27,7 @@ import { renderErAscii } from './er-diagram.ts'
 import { renderXYChartAscii } from './xychart.ts'
 import { detectColorMode, DEFAULT_ASCII_THEME, diagramColorsToAsciiTheme } from './ansi.ts'
 import type { AsciiConfig, AsciiTheme, ColorMode } from './types.ts'
-import type { MermaidGraph } from '../types.ts'
+import type { MermaidGraph, MermaidNode } from '../types.ts'
 import { wrapText } from './layout-budget.ts'
 import { maxLineWidth } from './multiline-utils.ts'
 import { getShapeDimensions } from './shapes/index.ts'
@@ -78,10 +78,6 @@ function detectDiagramType(text: string): 'flowchart' | 'sequence' | 'class' | '
   return 'flowchart'
 }
 
-function estimateFlowchartRanks(parsed: MermaidGraph): number {
-  return buildFlowchartDepthMap(parsed).maxDepth + 1
-}
-
 function buildFlowchartDepthMap(parsed: MermaidGraph): { depth: Map<string, number>; maxDepth: number } {
   const depth = new Map<string, number>()
   for (const nodeId of parsed.nodes.keys()) depth.set(nodeId, 0)
@@ -108,6 +104,16 @@ function estimateNaturalFlowchartWidth(parsed: MermaidGraph, config: AsciiConfig
   return orderedWidths.reduce((sum, width) => sum + width, 0) + Math.max(0, orderedWidths.length - 1) * config.paddingX
 }
 
+function estimateNaturalFlowchartTDWidth(parsed: MermaidGraph, config: AsciiConfig): number {
+  const levelMetrics = getFlowchartLevelMetrics(parsed, config)
+  let maxWidth = 0
+  for (const level of levelMetrics) {
+    const levelWidth = level.widths.reduce((sum, width) => sum + width, 0) + Math.max(0, level.widths.length - 1) * config.paddingX
+    maxWidth = Math.max(maxWidth, levelWidth)
+  }
+  return maxWidth
+}
+
 function getFlowchartRankMetrics(
   parsed: MermaidGraph,
   config: AsciiConfig,
@@ -130,6 +136,30 @@ function getFlowchartRankMetrics(
   return [...rankMetrics.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([rank, metric]) => ({ rank, width: metric.width, nodes: metric.nodes }))
+}
+
+function getFlowchartLevelMetrics(
+  parsed: MermaidGraph,
+  config: AsciiConfig,
+): Array<{ level: number; nodes: MermaidNode[]; widths: number[] }> {
+  const { depth } = buildFlowchartDepthMap(parsed)
+  const levelMetrics = new Map<number, { nodes: MermaidNode[]; widths: number[] }>()
+
+  for (const node of parsed.nodes.values()) {
+    const level = depth.get(node.id) ?? 0
+    const dims = getShapeDimensions(node.shape, node.label, {
+      useAscii: config.useAscii,
+      padding: config.boxBorderPadding,
+    })
+    const metric = levelMetrics.get(level) ?? { nodes: [], widths: [] }
+    metric.nodes.push(node)
+    metric.widths.push(dims.width)
+    levelMetrics.set(level, metric)
+  }
+
+  return [...levelMetrics.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([level, metric]) => ({ level, nodes: metric.nodes, widths: metric.widths }))
 }
 
 function capWidthsToBudget(widths: number[], totalBudget: number, minWidth: number): number[] {
@@ -174,6 +204,40 @@ function capWidthsToBudget(widths: number[], totalBudget: number, minWidth: numb
 
 function applyFlowchartWidthBudget(parsed: MermaidGraph, config: AsciiConfig): void {
   if (!config.maxWidth || config.maxWidth <= 0) return
+  if (config.graphDirection !== 'LR') {
+    const hasStatePseudoNode = [...parsed.nodes.values()].some(node => node.shape === 'state-start' || node.shape === 'state-end')
+    const availableWidth = hasStatePseudoNode ? Math.max(1, config.maxWidth - 7) : config.maxWidth
+    if (availableWidth >= estimateNaturalFlowchartTDWidth(parsed, config)) return
+
+    config.paddingX = Math.min(config.paddingX, 2)
+    if (availableWidth < estimateNaturalFlowchartTDWidth(parsed, config)) {
+      config.boxBorderPadding = Math.min(config.boxBorderPadding, 0)
+    }
+
+    for (const level of getFlowchartLevelMetrics(parsed, config)) {
+      const totalGapWidth = Math.max(0, level.widths.length - 1) * config.paddingX
+      const levelBudget = Math.max(0, availableWidth - totalGapWidth)
+      const levelCaps = capWidthsToBudget(level.widths, levelBudget, 8)
+
+      for (let i = 0; i < level.nodes.length; i++) {
+        const node = level.nodes[i]!
+        const levelCap = levelCaps[i] ?? level.widths[i]
+        if (!levelCap) continue
+
+        const dims = getShapeDimensions(node.shape, node.label, {
+          useAscii: config.useAscii,
+          padding: config.boxBorderPadding,
+        })
+        if (dims.width <= levelCap) continue
+
+        const overhead = dims.width - maxLineWidth(node.label)
+        const contentBudget = Math.max(1, levelCap - overhead)
+        node.label = wrapText(node.label, contentBudget)
+      }
+    }
+    return
+  }
+
   if (config.maxWidth >= estimateNaturalFlowchartWidth(parsed, config)) return
 
   config.paddingX = Math.min(config.paddingX, 2)
